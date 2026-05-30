@@ -28,20 +28,21 @@
   };
 
   XMLHttpRequest.prototype.send = function (body) {
-    if (this._interceptUrl && this._interceptUrl.includes('tracking_finish') && body) {
+    if (this._interceptUrl && this._interceptUrl.includes('tracking_') && body) {
       try {
-        // jQuery sends as URL-encoded form data
+        // audit_data and context_updates are nested inside a `json` field as a JSON string
         const params = new URLSearchParams(body);
+        if (params.has('json')) {
+          const inner = JSON.parse(params.get('json'));
+          delete inner.audit_data;
+          delete inner.context_updates;
+          params.set('json', JSON.stringify(inner));
+          body = params.toString();
+        }
+        // also strip any top-level audit_data just in case
         params.delete('audit_data');
         body = params.toString();
-      } catch (e) {
-        try {
-          // fallback: JSON body
-          const obj = JSON.parse(body);
-          delete obj.audit_data;
-          body = JSON.stringify(obj);
-        } catch (e2) {}
-      }
+      } catch (e) {}
     }
     return origSend.apply(this, [body]);
   };
@@ -58,6 +59,32 @@
     }
     return origFetch.apply(this, [input, init]);
   };
+
+  // --- jQuery ajaxSend hook (belt-and-suspenders over XHR patch) ---
+  function hookJQuery() {
+    if (!window.$) return false;
+    $(document).ajaxSend(function (event, xhr, settings) {
+      if (settings.url && settings.url.includes('tracking_')) {
+        try {
+          const params = new URLSearchParams(settings.data);
+          if (params.has('json')) {
+            const inner = JSON.parse(params.get('json'));
+            delete inner.audit_data;
+            delete inner.context_updates;
+            params.set('json', JSON.stringify(inner));
+            settings.data = params.toString();
+          }
+          params.delete('audit_data');
+          settings.data = params.toString();
+        } catch (e) {}
+      }
+    });
+    return true;
+  }
+
+  const jqHookInterval = setInterval(() => {
+    if (hookJQuery()) clearInterval(jqHookInterval);
+  }, 200);
 
   // --- Nullify slip player audit methods after it initializes ---
   function patchSlipPlayer() {
