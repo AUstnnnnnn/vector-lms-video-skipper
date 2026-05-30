@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Video Skipper — Vector LMS
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  Speed controls for Vector LMS — strips audit_data from tracking_finish to bypass fast-forward detection
+// @version      5.0
+// @description  Speed controls for Vector LMS — delays tracking_finish until server timer is satisfied
 // @match        file://*/*Sexual*Assault*Prevention*
 // @match        file://*/*Vector*LMS*
 // @match        file://*/*safecolleges*
@@ -17,100 +17,23 @@
 (function () {
   'use strict';
 
-  // --- XHR interception: strip audit_data from tracking_finish ---
-  // The server uses audit_data to detect fast-forward; remove it before the request fires.
+  // Record when tracking_start fires as our session baseline
+  let sessionStartTime = Date.now();
   const origOpen = XMLHttpRequest.prototype.open;
-  const origSend = XMLHttpRequest.prototype.send;
-
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     this._interceptUrl = url;
+    if (url && url.includes('tracking_start')) {
+      this.addEventListener('load', () => { sessionStartTime = Date.now(); });
+    }
     return origOpen.apply(this, [method, url, ...rest]);
   };
 
-  XMLHttpRequest.prototype.send = function (body) {
-    if (this._interceptUrl && this._interceptUrl.includes('tracking_') && body) {
-      try {
-        // audit_data and context_updates are nested inside a `json` field as a JSON string
-        const params = new URLSearchParams(body);
-        if (params.has('json')) {
-          const inner = JSON.parse(params.get('json'));
-          delete inner.audit_data;
-          delete inner.context_updates;
-          params.set('json', JSON.stringify(inner));
-          body = params.toString();
-        }
-        // also strip any top-level audit_data just in case
-        params.delete('audit_data');
-        body = params.toString();
-      } catch (e) {}
-    }
-    return origSend.apply(this, [body]);
-  };
-
-  // Also intercept fetch (in case the page ever switches)
-  const origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    if (init && init.body && typeof input === 'string' && input.includes('tracking_finish')) {
-      try {
-        const params = new URLSearchParams(init.body);
-        params.delete('audit_data');
-        init = { ...init, body: params.toString() };
-      } catch (e) {}
-    }
-    return origFetch.apply(this, [input, init]);
-  };
-
-  // --- jQuery ajaxSend hook (belt-and-suspenders over XHR patch) ---
-  function hookJQuery() {
-    if (!window.$) return false;
-    $(document).ajaxSend(function (event, xhr, settings) {
-      if (settings.url && settings.url.includes('tracking_')) {
-        try {
-          const params = new URLSearchParams(settings.data);
-          if (params.has('json')) {
-            const inner = JSON.parse(params.get('json'));
-            delete inner.audit_data;
-            delete inner.context_updates;
-            params.set('json', JSON.stringify(inner));
-            settings.data = params.toString();
-          }
-          params.delete('audit_data');
-          settings.data = params.toString();
-        } catch (e) {}
-      }
-    });
-    return true;
-  }
-
-  const jqHookInterval = setInterval(() => {
-    if (hookJQuery()) clearInterval(jqHookInterval);
-  }, 200);
-
-  // --- Nullify slip player audit methods after it initializes ---
-  function patchSlipPlayer() {
-    try {
-      const $slip = window.$player?.sl_jwplayer?.call(window.$player);
-      if ($slip) {
-        if ($slip.get_audit_data) $slip.get_audit_data = () => null;
-        if ($slip.get_context_changes) $slip.get_context_changes = () => null;
-        $slip.uses_suppression_rules = false;
-        $slip.audit_level = 0;
-        return true;
-      }
-    } catch (e) {}
-    return false;
-  }
-
-  // Retry patching until slip player is ready
-  const patchInterval = setInterval(() => {
-    if (patchSlipPlayer()) clearInterval(patchInterval);
-  }, 500);
-
-  // --- UI (injected after DOM ready) ---
+  // --- UI + logic (after DOM ready) ---
   function initUI() {
     const SPEEDS = [1, 2, 4, 8, 16];
     let speedIdx = 0;
     let enforceInterval = null;
+    let countdownInterval = null;
 
     function getVideo() {
       return document.querySelector('video.vjs-tech') || document.querySelector('video');
@@ -134,6 +57,54 @@
       applySpeed(SPEEDS[speedIdx]);
     }
 
+    // Wrap finish_tracking to delay until server timer is satisfied
+    function wrapFinishTracking() {
+      if (!window.ss_player_tracking || !window.ss_player_tracking.finish_tracking) return false;
+      if (window.ss_player_tracking._wrapped) return true;
+
+      const orig = window.ss_player_tracking.finish_tracking;
+      window.ss_player_tracking.finish_tracking = function (options) {
+        const vid = getVideo();
+        const duration = vid && isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 0;
+        const elapsed = (Date.now() - sessionStartTime) / 1000;
+        // Require 92% of video duration to have elapsed in real time
+        const required = duration * 0.92;
+        const wait = Math.max(0, required - elapsed);
+
+        if (wait > 1) {
+          showCountdown(wait, () => orig.call(window.ss_player_tracking, options));
+        } else {
+          orig.call(window.ss_player_tracking, options);
+        }
+      };
+      window.ss_player_tracking._wrapped = true;
+      return true;
+    }
+
+    const wrapInterval = setInterval(() => {
+      if (wrapFinishTracking()) clearInterval(wrapInterval);
+    }, 300);
+
+    // Countdown display in the overlay
+    function showCountdown(waitSecs, callback) {
+      clearInterval(enforceInterval); // stop speed enforcement while waiting
+      let remaining = Math.ceil(waitSecs);
+      speedBtn.textContent = `${remaining}s`;
+      speedBtn.title = 'Waiting for server timer…';
+
+      countdownInterval = setInterval(() => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          clearInterval(countdownInterval);
+          speedBtn.textContent = '✓';
+          setTimeout(callback, 100);
+        } else {
+          speedBtn.textContent = `${remaining}s`;
+        }
+      }, 1000);
+    }
+
+    // Build overlay
     const overlay = document.createElement('div');
     overlay.style.cssText = [
       'position:fixed',
@@ -175,7 +146,7 @@
     }
 
     const speedBtn = makeBtn('1x', 'Cycle speed: 1x → 2x → 4x → 8x → 16x', cycleSpeed);
-    speedBtn.style.minWidth = '36px';
+    speedBtn.style.minWidth = '42px';
     speedBtn.style.textAlign = 'center';
 
     const muteBtn = makeBtn('🔇', 'Toggle mute', () => {
