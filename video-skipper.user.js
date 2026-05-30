@@ -37,7 +37,7 @@
       enforceInterval = setInterval(() => {
         const v = getVideo();
         if (v && v.playbackRate !== rate) v.playbackRate = rate;
-      }, 500);
+      }, 50);
     }
   }
 
